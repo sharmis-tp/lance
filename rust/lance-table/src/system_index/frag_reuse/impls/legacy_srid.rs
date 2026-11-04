@@ -22,7 +22,8 @@ use crate::system_index::frag_reuse::CompactFragReuseIndex;
 use crate::system_index::frag_reuse::history::{HistoryFormat, RewriteRecord};
 use crate::system_index::frag_reuse::mapping::MappingSource;
 use crate::system_index::frag_reuse::plan::{
-    ReadContext, ReadPlan, RowDomain, SegmentSummary, TranslationPlan, TranslationSupport,
+    Composition, ReadContext, ReadPlan, RewriteContext, RowDomain, SegmentSummary, TranslationPlan,
+    TranslationSupport,
 };
 
 #[derive(Debug)]
@@ -106,6 +107,14 @@ impl FriImpl for LegacySridHistory {
                 }
             })
             .collect()
+    }
+
+    fn compose(
+        self: Arc<Self>,
+        context: &RewriteContext,
+        segment: &SegmentSummary,
+    ) -> Result<Composition> {
+        self.0.clone().compose(context, segment)
     }
 
     fn bind(&self, plan: TranslationPlan, mappings: Arc<dyn MappingSource>) -> Remapper {
