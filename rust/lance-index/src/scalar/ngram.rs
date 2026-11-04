@@ -478,23 +478,43 @@ impl NGramIndex {
     ) -> Result<CreatedIndex> {
         let frag_reuse_index = frag_reuse_index
             .map(|index| Arc::new(FragReuseIndexHandle(index)) as Arc<dyn RowIdRemapper>);
-        Self::merge_segments_with_remapper(
+        Self::merge_remapped_segments(
             segment_stores,
             new_data,
             dest_store,
             old_data_filters,
-            frag_reuse_index,
+            DeprecatedRemapper::sync(frag_reuse_index),
         )
         .await
     }
 
     #[doc(hidden)]
+    #[deprecated(since = "15.0.0", note = "use NGramIndex::merge_remapped_segments")]
     pub async fn merge_segments_with_remapper(
         segment_stores: &[Arc<dyn IndexStore>],
         new_data: Option<SendableRecordBatchStream>,
         dest_store: &dyn IndexStore,
         old_data_filters: &[Option<super::OldIndexDataFilter>],
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<CreatedIndex> {
+        Self::merge_remapped_segments(
+            segment_stores,
+            new_data,
+            dest_store,
+            old_data_filters,
+            DeprecatedRemapper::sync(frag_reuse_index),
+        )
+        .await
+    }
+
+    /// [`Self::merge_segments`], translating the segments' stored addresses
+    /// through `remapper` before they are merged.
+    pub async fn merge_remapped_segments(
+        segment_stores: &[Arc<dyn IndexStore>],
+        new_data: Option<SendableRecordBatchStream>,
+        dest_store: &dyn IndexStore,
+        old_data_filters: &[Option<super::OldIndexDataFilter>],
+        remapper: Option<Remapper>,
     ) -> Result<CreatedIndex> {
         let mut builder = NGramIndexBuilder::try_new(NGramIndexBuilderOptions::default())?;
         // Pure consolidation has no new rows, so skip `train` (and its
@@ -508,7 +528,7 @@ impl NGramIndex {
                 new_data_spills,
                 segment_stores,
                 old_data_filters,
-                frag_reuse_index,
+                remapper,
                 dest_store,
             )
             .await?;
@@ -954,31 +974,31 @@ impl NGramIndexSpillState {
         Ok(batches)
     }
 
-    fn remap_and_filter_rows(
+    async fn remap_and_filter_rows(
         self,
-        frag_reuse_index: Option<&dyn RowIdRemapper>,
+        remapper: Option<&Remapper>,
         filter: Option<&super::OldIndexDataFilter>,
-    ) -> Self {
-        if let Some(fri) = frag_reuse_index {
-            return self.remap_then_keep(fri, filter);
+    ) -> Result<Self> {
+        if let Some(remapper) = remapper {
+            return self.remap_then_keep(remapper, filter).await;
         }
-        match filter {
+        Ok(match filter {
             None => self,
             Some(filter) => self.retain_rows(filter),
-        }
+        })
     }
 
     /// Remap stale addresses per row, keeping only rows still selected by
     /// `filter`. Used only under a pending deferred-remap compaction.
-    fn remap_then_keep(
+    async fn remap_then_keep(
         self,
-        fri: &dyn RowIdRemapper,
+        remapper: &Remapper,
         filter: Option<&super::OldIndexDataFilter>,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut tokens = UInt32Builder::with_capacity(self.tokens.len());
         let mut bitmaps = Vec::with_capacity(self.bitmaps.len());
         for (token, bitmap) in self.tokens.values().iter().zip(self.bitmaps) {
-            let remapped = fri.remap_row_ids_roaring_tree_map(&bitmap);
+            let remapped = translate_treemap(remapper, &bitmap).await?;
             let kept = match filter {
                 Some(filter) => RoaringTreemap::from_iter(
                     remapped
@@ -992,10 +1012,10 @@ impl NGramIndexSpillState {
                 bitmaps.push(kept);
             }
         }
-        Self {
+        Ok(Self {
             tokens: tokens.finish(),
             bitmaps,
-        }
+        })
     }
 
     fn retain_rows(self, filter: &super::OldIndexDataFilter) -> Self {
@@ -1716,16 +1736,21 @@ impl NGramIndexBuilder {
 
     async fn open_segment_stream(
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         filter: Option<super::OldIndexDataFilter>,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<NGramIndexSpillState>> + Send>>> {
         let reader = store.open_index_file(POSTINGS_FILENAME).await?;
-        let stream =
-            Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.map(move |res| {
-                res.map(|state| {
-                    state.remap_and_filter_rows(frag_reuse_index.as_deref(), filter.as_ref())
-                })
-            });
+        let stream = Self::stream_spill_reader(reader, MAX_POSTING_LIST_BATCH_BYTES)?.and_then(
+            move |state| {
+                let remapper = remapper.clone();
+                let filter = filter.clone();
+                async move {
+                    state
+                        .remap_and_filter_rows(remapper.as_ref(), filter.as_ref())
+                        .await
+                }
+            },
+        );
         Ok(Box::pin(stream))
     }
 
@@ -1736,7 +1761,7 @@ impl NGramIndexBuilder {
         new_data_spills: Vec<usize>,
         segment_stores: &[Arc<dyn IndexStore>],
         old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapper: Option<Remapper>,
         dest_store: &dyn IndexStore,
     ) -> Result<IndexFile> {
         if old_data_filters.len() != segment_stores.len() {
@@ -1761,7 +1786,7 @@ impl NGramIndexBuilder {
         if segment_stores.len() == 1 {
             let seg_stream = Self::open_segment_stream(
                 segment_stores[0].clone(),
-                frag_reuse_index,
+                remapper,
                 old_data_filters[0].clone(),
             )
             .await?;
@@ -1786,7 +1811,7 @@ impl NGramIndexBuilder {
             let out = next_spill + offset;
             spills.push(out);
             let spill_store = self.spill_store.clone();
-            let fri = frag_reuse_index.clone();
+            let fri = remapper.clone();
             let s0 = stores[0].clone();
             let f0 = filters[0].clone();
             let second = (stores.len() == 2).then(|| (stores[1].clone(), filters[1].clone()));
@@ -2576,6 +2601,7 @@ mod tests {
     /// address of the batch first would produce), and every row comes out
     /// translated.
     #[test_log::test(tokio::test)]
+    #[allow(deprecated)]
     async fn test_ngram_index_remap_translates_postings_in_bounded_slices() {
         use lance_index_core::remapping::BatchRowIdRemapper;
         use std::sync::Mutex;
@@ -2768,7 +2794,10 @@ mod tests {
         valid.insert_fragment(0);
         valid.insert(addr(1, 0));
 
-        let filtered = state.remap_and_filter_rows(None, Some(&OldIndexDataFilter::RowIds(valid)));
+        let filtered = futures::executor::block_on(
+            state.remap_and_filter_rows(None, Some(&OldIndexDataFilter::RowIds(valid))),
+        )
+        .unwrap();
 
         // Token 20 lived only in retired fragment 2, so it is dropped entirely.
         assert_eq!(filtered.tokens.values().to_vec(), vec![10u32, 30]);
@@ -2786,6 +2815,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_remap_then_keep_relocates_and_filters() {
         use arrow_array::UInt32Array;
         use roaring::{RoaringBitmap, RoaringTreemap};
@@ -2810,14 +2840,15 @@ mod tests {
         // Compaction fused fragment 0 into fragment 2: row (0,0) survives at
         // (2,0), row (0,1) was deleted (maps to None). Row (1,0) isn't in the
         // map, so remap passes it through unchanged.
-        let fri = FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
+        let fri = Arc::new(FragReuseIndexHandle(Arc::new(FragReuseIndex::new(
             Uuid::new_v4(),
             vec![HashMap::from([
                 (addr(0, 0), Some(addr(2, 0))),
                 (addr(0, 1), None),
             ])],
             FragReuseIndexDetails { versions: vec![] },
-        )));
+        )))) as Arc<dyn crate::scalar::RowIdRemapper>;
+        let remapper = lance_index_core::remapping::DeprecatedRemapper::sync(Some(fri)).unwrap();
 
         // After remap the live rows sit in fragments 2 and 1; fragment 1 is retired.
         let filter = OldIndexDataFilter::Fragments {
@@ -2825,7 +2856,10 @@ mod tests {
             to_remove: RoaringBitmap::from_iter([1u32]),
         };
 
-        let filtered = state.remap_and_filter_rows(Some(&fri), Some(&filter));
+        let filtered = futures::executor::block_on(
+            state.remap_and_filter_rows(Some(&remapper), Some(&filter)),
+        )
+        .unwrap();
 
         // Only the relocated, still-live row survives: (0,0) -> (2,0). (0,1) was
         // dropped by remap; (1,0) was dropped by the retired-fragment filter.

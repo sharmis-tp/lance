@@ -2238,6 +2238,7 @@ pub(crate) async fn remap_index_map(
 /// remaps directly; a batch translator translates the posting in bounded
 /// batches (`remap_row_addrs_tree_map_async`) and never resolves it into a
 /// map, so one posting list is the unit of work here.
+#[allow(deprecated)]
 pub(crate) async fn remap_row_addrs_with(
     bitmap: &RowAddrTreeMap,
     translator: RowAddrTranslatorRef<'_>,
@@ -2246,6 +2247,10 @@ pub(crate) async fn remap_row_addrs_with(
         RowAddrTranslatorRef::Sync(mapping) => remap_row_addrs(bitmap, mapping),
         RowAddrTranslatorRef::Batch(remapper) => {
             remap_row_addrs_tree_map_async(remapper, bitmap).await
+        }
+        RowAddrTranslatorRef::Remapper(remapper) => {
+            lance_index_core::remapping::check_batch_remapping_entry()?;
+            remapper.translate_set(bitmap).await
         }
         #[allow(unreachable_patterns)]
         _ => Err(Error::not_supported(
@@ -3852,6 +3857,7 @@ mod tests {
     /// legacy `remap`), and it writes what the legacy `remap` writes for the
     /// same translation.
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_bitmap_remap_streaming_never_enters_the_fallback() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
