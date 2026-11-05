@@ -488,25 +488,6 @@ impl NGramIndex {
         .await
     }
 
-    #[doc(hidden)]
-    #[deprecated(since = "15.0.0", note = "use NGramIndex::merge_remapped_segments")]
-    pub async fn merge_segments_with_remapper(
-        segment_stores: &[Arc<dyn IndexStore>],
-        new_data: Option<SendableRecordBatchStream>,
-        dest_store: &dyn IndexStore,
-        old_data_filters: &[Option<super::OldIndexDataFilter>],
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
-    ) -> Result<CreatedIndex> {
-        Self::merge_remapped_segments(
-            segment_stores,
-            new_data,
-            dest_store,
-            old_data_filters,
-            DeprecatedRemapper::sync(frag_reuse_index),
-        )
-        .await
-    }
-
     /// [`Self::merge_segments`], translating the segments' stored addresses
     /// through `remapper` before they are merged.
     pub async fn merge_remapped_segments(
@@ -2815,7 +2796,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_remap_then_keep_relocates_and_filters() {
         use arrow_array::UInt32Array;
         use roaring::{RoaringBitmap, RoaringTreemap};
